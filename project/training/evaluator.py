@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -15,7 +16,7 @@ from controller.hybrid_controller import HybridController
 from env.simglucose_env import SimglucoseEnv
 from planner.g2p2c_planner import G2P2CPlanner
 from utils.metrics import EpisodeMetrics
-from utils.reward import basal_step_reward, bolus_step_reward
+from utils.reward import BASAL_REWARD_WINDOW_HOURS, basal_step_reward_from_buffer, bolus_step_reward
 from utils.seed import set_global_seed
 from utils.state_builder import SlidingWindowStateBuilder
 
@@ -74,6 +75,10 @@ class Evaluator:
                     self.cfg.training.bolus_meal_timing_window_minutes / max(float(self.cfg.env.step_minutes), 1.0)
                 )
             ),
+        )
+        self._basal_reward_window_steps = max(
+            1,
+            int(round((BASAL_REWARD_WINDOW_HOURS * 60) / max(float(self.cfg.env.step_minutes), 1.0))),
         )
 
     def evaluate(
@@ -134,6 +139,7 @@ class Evaluator:
             planner_predicted_low_steps = 0
             meal_window_steps_remaining = 0
             recent_meal_grams = 0.0
+            basal_bg_buffer: deque[float] = deque(maxlen=self._basal_reward_window_steps)
 
             while not done and steps < self.cfg.training.max_steps_per_episode:
                 action = self.controller.policy(observation=observation, reward=0.0, done=done, info=info)
@@ -146,6 +152,7 @@ class Evaluator:
 
                 glucose = SimglucoseEnv.extract_glucose(observation)
                 meal = self._extract_meal(info)
+                basal_bg_buffer.append(glucose)
 
                 if meal > 0.0:
                     meal_window_steps_remaining = max(meal_window_steps_remaining, self._meal_window_steps)
@@ -157,19 +164,21 @@ class Evaluator:
                     recent_meal_grams = 0.0
 
                 if decision is not None:
-                    if decision.planner.intervened:
-                        planner_interventions += 1
-                    if decision.planner.hard_safety_applied:
-                        planner_hard_safety_count += 1
-                    if decision.planner.predicted_min_glucose < self.cfg.planner.low_glucose_threshold:
-                        planner_predicted_low_steps += 1
+                    planner_active = decision.planner.mode not in ("bypass", "disabled")
+                    if planner_active:
+                        if decision.planner.intervened:
+                            planner_interventions += 1
+                        if decision.planner.hard_safety_applied:
+                            planner_hard_safety_count += 1
+                        if decision.planner.predicted_min_glucose < self.cfg.planner.low_glucose_threshold:
+                            planner_predicted_low_steps += 1
 
                 metrics.update(
                     glucose=glucose,
                     basal=float(action.basal),
                     bolus=float(action.bolus),
                     meal=meal,
-                    reward_basal=basal_step_reward(glucose),
+                    reward_basal=basal_step_reward_from_buffer(tuple(basal_bg_buffer)),
                     reward_bolus=bolus_step_reward(
                         glucose,
                         meal,

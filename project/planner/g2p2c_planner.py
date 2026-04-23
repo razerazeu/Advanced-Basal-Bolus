@@ -42,19 +42,10 @@ class G2P2CPlanner:
         meal_grams: float,
         recent_insulin: float = 0.0,
     ) -> tuple[float, float, PlannerResult]:
-        """Evaluate candidate trajectories and select a safer action."""
+        """Evaluate bolus candidates with fixed basal and pick safest high-score action."""
 
         basal = float(np.clip(proposed_basal, *self.cfg.basal_bounds))
         bolus = float(np.clip(proposed_bolus, *self.cfg.bolus_bounds))
-
-        if meal_grams <= 0.0 and current_glucose <= 150.0:
-            bolus = float(min(bolus, 0.05))
-        if meal_grams <= 0.0 and current_glucose <= 130.0:
-            bolus = 0.0
-
-        if current_glucose <= self.cfg.low_glucose_threshold:
-            basal = float(np.clip(basal * self.cfg.emergency_basal_scale, *self.cfg.basal_bounds))
-            bolus = float(np.clip(min(bolus, self.cfg.emergency_bolus_max), *self.cfg.bolus_bounds))
 
         if not self.cfg.enabled:
             traj = self._rollout(current_glucose, meal_grams, basal, bolus, initial_recent_insulin=recent_insulin)
@@ -71,105 +62,90 @@ class G2P2CPlanner:
             )
             return basal, bolus, result
 
-        candidates = self._generate_candidates(
+        candidates = self._generate_candidates(bolus=bolus)
+
+        best_overall_bolus = bolus
+        best_overall_score = float("-inf")
+        best_overall_traj = self._rollout(
+            current_glucose=current_glucose,
+            initial_meal_grams=meal_grams,
             basal=basal,
             bolus=bolus,
-            current_glucose=current_glucose,
-            meal_grams=meal_grams,
+            initial_recent_insulin=recent_insulin,
         )
 
-        best_score = float("-inf")
-        best_candidate = (basal, bolus)
+        best_safe_bolus: float | None = None
+        best_safe_score = float("-inf")
+        best_safe_traj: np.ndarray | None = None
 
-        for cand_basal, cand_bolus in candidates:
+        for cand_bolus in candidates:
             trajectory = self._rollout(
                 current_glucose=current_glucose,
                 initial_meal_grams=meal_grams,
-                basal=cand_basal,
+                basal=basal,
                 bolus=cand_bolus,
                 initial_recent_insulin=recent_insulin,
             )
             score = self._score_trajectory(trajectory)
-            if score > best_score:
-                best_score = score
-                best_candidate = (cand_basal, cand_bolus)
+            predicted_min = float(np.min(trajectory))
 
-        if self.cfg.mode == "hard":
-            final_basal, final_bolus = best_candidate
-        else:
-            # Soft mode nudges the policy output toward the safest candidate.
-            final_basal = basal + self.cfg.soft_adjustment_gain * (best_candidate[0] - basal)
-            final_bolus = bolus + self.cfg.soft_adjustment_gain * (best_candidate[1] - bolus)
+            if score > best_overall_score:
+                best_overall_score = score
+                best_overall_bolus = cand_bolus
+                best_overall_traj = trajectory
 
-            final_basal = float(np.clip(final_basal, *self.cfg.basal_bounds))
-            final_bolus = float(np.clip(final_bolus, *self.cfg.bolus_bounds))
+            if predicted_min >= self.cfg.severe_hypoglycemia_threshold and score > best_safe_score:
+                best_safe_score = score
+                best_safe_bolus = cand_bolus
+                best_safe_traj = trajectory
 
         hard_safety_applied = False
+        if best_safe_bolus is not None and best_safe_traj is not None:
+            selected_bolus = best_safe_bolus
+            selected_traj = best_safe_traj
+            selected_score = best_safe_score
+        else:
+            selected_bolus = best_overall_bolus
+            selected_traj = best_overall_traj
+            selected_score = best_overall_score
+            hard_safety_applied = True
 
-        # Enforce a final hard safety gate even after candidate optimization.
+        if self.cfg.mode == "soft":
+            final_bolus = bolus + self.cfg.soft_adjustment_gain * (selected_bolus - bolus)
+            final_bolus = float(np.clip(final_bolus, *self.cfg.bolus_bounds))
+        else:
+            final_bolus = float(selected_bolus)
+
+        final_basal = basal
+
         if current_glucose <= self.cfg.severe_hypoglycemia_threshold:
-            final_basal = float(self.cfg.basal_bounds[0])
             final_bolus = float(self.cfg.bolus_bounds[0])
             hard_safety_applied = True
-        elif current_glucose <= self.cfg.low_glucose_threshold:
-            final_basal = float(np.clip(min(final_basal, basal), *self.cfg.basal_bounds))
-            final_bolus = float(np.clip(min(final_bolus, self.cfg.emergency_bolus_max), *self.cfg.bolus_bounds))
+
+        if (
+            current_glucose <= self.cfg.low_glucose_threshold
+            and recent_insulin >= self.cfg.iob_safety_threshold
+        ):
+            final_bolus = float(self.cfg.bolus_bounds[0])
             hard_safety_applied = True
 
         final_trajectory = self._rollout(
             current_glucose=current_glucose,
             initial_meal_grams=meal_grams,
-            basal=float(final_basal),
-            bolus=float(final_bolus),
+            basal=final_basal,
+            bolus=final_bolus,
             initial_recent_insulin=recent_insulin,
         )
         predicted_min = float(np.min(final_trajectory))
-        predicted_low_threshold = self.cfg.low_glucose_threshold + self.cfg.predicted_safety_margin
 
-        if (
-            current_glucose <= (self.cfg.low_glucose_threshold + 20.0)
-            and recent_insulin >= self.cfg.iob_safety_threshold
-        ):
-            final_basal = float(self.cfg.basal_bounds[0])
+        if predicted_min < self.cfg.severe_hypoglycemia_threshold:
             final_bolus = float(self.cfg.bolus_bounds[0])
             hard_safety_applied = True
             final_trajectory = self._rollout(
                 current_glucose=current_glucose,
                 initial_meal_grams=meal_grams,
-                basal=float(final_basal),
-                bolus=float(final_bolus),
-                initial_recent_insulin=recent_insulin,
-            )
-            predicted_min = float(np.min(final_trajectory))
-
-        if predicted_min < predicted_low_threshold:
-            safer_basal = float(np.clip(final_basal * self.cfg.emergency_basal_scale, *self.cfg.basal_bounds))
-            safer_bolus = float(np.clip(min(final_bolus, self.cfg.emergency_bolus_max), *self.cfg.bolus_bounds))
-
-            if (abs(safer_basal - final_basal) > 1e-9) or (abs(safer_bolus - final_bolus) > 1e-9):
-                hard_safety_applied = True
-
-            final_basal, final_bolus = safer_basal, safer_bolus
-            final_trajectory = self._rollout(
-                current_glucose=current_glucose,
-                initial_meal_grams=meal_grams,
-                basal=float(final_basal),
-                bolus=float(final_bolus),
-                initial_recent_insulin=recent_insulin,
-            )
-            predicted_min = float(np.min(final_trajectory))
-
-        if predicted_min < self.cfg.severe_hypoglycemia_threshold:
-            if final_basal > self.cfg.basal_bounds[0] or final_bolus > self.cfg.bolus_bounds[0]:
-                hard_safety_applied = True
-
-            final_basal = float(self.cfg.basal_bounds[0])
-            final_bolus = float(self.cfg.bolus_bounds[0])
-            final_trajectory = self._rollout(
-                current_glucose=current_glucose,
-                initial_meal_grams=meal_grams,
-                basal=float(final_basal),
-                bolus=float(final_bolus),
+                basal=final_basal,
+                bolus=final_bolus,
                 initial_recent_insulin=recent_insulin,
             )
             predicted_min = float(np.min(final_trajectory))
@@ -191,49 +167,20 @@ class G2P2CPlanner:
 
     def _generate_candidates(
         self,
-        basal: float,
         bolus: float,
-        current_glucose: float,
-        meal_grams: float,
-    ) -> list[tuple[float, float]]:
-        """Build candidate actions around SAC proposals."""
+    ) -> list[float]:
+        """Build bolus candidates around SAC proposal while keeping basal fixed."""
 
-        candidates: set[tuple[float, float]] = set()
-        allow_aggressive_insulin = (current_glucose >= 220.0) or (meal_grams >= 30.0)
+        candidates: set[float] = {
+            float(np.clip(bolus, *self.cfg.bolus_bounds)),
+            float(self.cfg.bolus_bounds[0]),
+        }
 
-        if allow_aggressive_insulin:
-            scales = self.cfg.candidate_scales
-            offsets = self.cfg.bolus_offsets
-        else:
-            scales = tuple(scale for scale in self.cfg.candidate_scales if scale <= 1.0)
-            offsets = tuple(offset for offset in self.cfg.bolus_offsets if offset <= 0.0)
+        for scale in self.cfg.candidate_scales:
+            candidates.add(float(np.clip(bolus * scale, *self.cfg.bolus_bounds)))
 
-        if not scales:
-            scales = (1.0,)
-        if not offsets:
-            offsets = (0.0,)
-
-        conservative_basal = float(np.clip(0.5 * basal, *self.cfg.basal_bounds))
-        candidates.add((float(np.clip(basal, *self.cfg.basal_bounds)), 0.0))
-        candidates.add((conservative_basal, 0.0))
-        candidates.add((self.cfg.basal_bounds[0], 0.0))
-
-        for scale in scales:
-            b_cand = float(np.clip(basal * scale, *self.cfg.basal_bounds))
-            bo_cand = float(np.clip(bolus * scale, *self.cfg.bolus_bounds))
-            candidates.add((b_cand, bo_cand))
-            candidates.add((b_cand, 0.0))
-
-            for offset in offsets:
-                bo_off = float(np.clip(bo_cand + offset, *self.cfg.bolus_bounds))
-                candidates.add((b_cand, bo_off))
-
-        candidates.add(
-            (
-                float(np.clip(basal, *self.cfg.basal_bounds)),
-                float(np.clip(bolus, *self.cfg.bolus_bounds)),
-            )
-        )
+        for offset in self.cfg.bolus_offsets:
+            candidates.add(float(np.clip(bolus + offset, *self.cfg.bolus_bounds)))
 
         return sorted(candidates)
 
@@ -272,15 +219,6 @@ class G2P2CPlanner:
         return np.asarray(trajectory, dtype=np.float32)
 
     def _score_trajectory(self, trajectory: np.ndarray) -> float:
-        """Planner objective: maximize cumulative risk-sensitive reward."""
+        """Planner objective: maximize cumulative one-step risk reward."""
 
-        base_score = float(sum(planner_risk_reward(float(g)) for g in trajectory))
-
-        predicted_low_threshold = self.cfg.low_glucose_threshold + self.cfg.predicted_safety_margin
-        below_low = int(np.sum(trajectory < predicted_low_threshold))
-        below_severe = int(np.sum(trajectory < self.cfg.severe_hypoglycemia_threshold))
-
-        penalty = (below_low * self.cfg.hypoglycemia_penalty) + (
-            below_severe * self.cfg.severe_hypoglycemia_penalty
-        )
-        return base_score - float(penalty)
+        return float(sum(planner_risk_reward(float(g)) for g in trajectory))

@@ -28,7 +28,7 @@ def test_planner_returns_valid_action() -> None:
     assert len(result.trajectory) == cfg.planner.horizon_steps
 
 
-def test_planner_hard_safety_zeroes_insulin_when_low() -> None:
+def test_planner_hard_safety_zeroes_bolus_when_low() -> None:
     cfg = default_config()
     planner = G2P2CPlanner(cfg.planner)
 
@@ -40,6 +40,6 @@ def test_planner_hard_safety_zeroes_insulin_when_low() -> None:
         recent_insulin=0.25,
     )
 
-    assert basal == 0.0
+    assert basal == 0.4
     assert bolus == 0.0
     assert result.hard_safety_applied

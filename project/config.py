@@ -104,7 +104,7 @@ class PlannerConfig:
     enabled: bool = True
     mode: Literal["hard", "soft"] = "hard"
     horizon_steps: int = 6
-    candidate_scales: tuple[float, ...] = (0.2, 0.4, 0.6, 0.8, 1.0)
+    candidate_scales: tuple[float, ...] = (0.8, 1.0, 1.2)
     bolus_offsets: tuple[float, ...] = (-0.15, -0.05, 0.0)
     basal_bounds: tuple[float, float] = (0.0, 0.6)
     bolus_bounds: tuple[float, float] = (0.0, 1.0)
@@ -160,7 +160,7 @@ class TrainingConfig:
     run_name: str = "dual_sac_g2p2c"
     device: str = "cpu"
     basal_pretrain_scenario: ScenarioName = "A"
-    bolus_train_scenario: ScenarioName = "B"
+    bolus_train_scenario: ScenarioName = "A"
     eval_scenarios: tuple[ScenarioName, ...] = ("A", "B", "C")
     basal_fasting_end_hour: int = 7
     basal_fasting_end_minute: int = 0

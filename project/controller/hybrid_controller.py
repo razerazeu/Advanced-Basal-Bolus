@@ -57,6 +57,8 @@ class HybridController:
         self.planner_enabled = True
         self.fixed_bolus = 0.0
         self.total_env_steps = 0
+        self.basal_phase_steps = 0
+        self.bolus_phase_steps = 0
         self.last_total_insulin = 0.0
         self.current_time = datetime(2026, 1, 1, 0, 0)
         self.last_decision: ControllerDecision | None = None
@@ -79,12 +81,20 @@ class HybridController:
     ) -> None:
         """Configure policy behavior for staged training and evaluation."""
 
+        prev_basal_training = self.basal_training
+        prev_bolus_training = self.bolus_training
+
         self.basal_training = basal_training
         self.bolus_training = bolus_training
         self.bolus_enabled = bolus_enabled
         self.planner_enabled = planner_enabled
         self.fixed_bolus = max(0.0, float(fixed_bolus))
         self.training = bool(basal_training or bolus_training)
+
+        if basal_training and not prev_basal_training:
+            self.basal_phase_steps = 0
+        if bolus_training and not prev_bolus_training:
+            self.bolus_phase_steps = 0
 
     def reset(self, start_time: datetime, initial_cgm: float = 110.0) -> None:
         """Reset internal controller state at episode start."""
@@ -114,7 +124,7 @@ class HybridController:
             state=state,
             sim_time=sim_time,
             training=self.basal_training,
-            total_env_steps=self.total_env_steps,
+            total_env_steps=self.basal_phase_steps,
         )
 
         if self.bolus_enabled:
@@ -124,7 +134,7 @@ class HybridController:
                 meal_grams=meal,
                 current_glucose=glucose,
                 training=self.bolus_training,
-                total_env_steps=self.total_env_steps,
+                total_env_steps=self.bolus_phase_steps,
             )
         else:
             bolus_norm, proposed_bolus, bolus_made = -1.0, self.fixed_bolus, False
@@ -169,6 +179,11 @@ class HybridController:
             bolus_decision_made=bool(bolus_made),
             planner=planner_result,
         )
+
+        if self.basal_training:
+            self.basal_phase_steps += 1
+        if self.bolus_training and self.bolus_enabled:
+            self.bolus_phase_steps += 1
 
         self.total_env_steps += 1
         return action

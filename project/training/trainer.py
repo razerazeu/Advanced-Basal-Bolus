@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -16,7 +17,7 @@ from controller.hybrid_controller import HybridController
 from env.simglucose_env import SimglucoseEnv
 from planner.g2p2c_planner import G2P2CPlanner
 from utils.metrics import EpisodeMetrics
-from utils.reward import basal_step_reward, bolus_step_reward
+from utils.reward import BASAL_REWARD_WINDOW_HOURS, basal_step_reward_from_buffer, bolus_step_reward
 from utils.seed import set_global_seed
 from utils.state_builder import SlidingWindowStateBuilder
 
@@ -67,6 +68,10 @@ class Trainer:
                     self.cfg.training.bolus_meal_timing_window_minutes / max(float(self.cfg.env.step_minutes), 1.0)
                 )
             ),
+        )
+        self._basal_reward_window_steps = max(
+            1,
+            int(round((BASAL_REWARD_WINDOW_HOURS * 60) / max(float(self.cfg.env.step_minutes), 1.0))),
         )
 
     def train(self) -> list[dict[str, float | str]]:
@@ -135,6 +140,11 @@ class Trainer:
 
         if basal_checkpoint is not None:
             self.basal_agent.load(str(basal_checkpoint))
+        elif self.cfg.training.freeze_basal_during_bolus:
+            raise ValueError(
+                "Running bolus-only training with frozen basal requires --basal-checkpoint. "
+                "Use --mode train for staged training or provide a pretrained basal checkpoint."
+            )
 
         summaries = self._run_phase(
             phase_name="bolus_train",
@@ -225,6 +235,7 @@ class Trainer:
         bolus_updates = 0
         meal_window_steps_remaining = 0
         recent_meal_grams = 0.0
+        basal_bg_buffer: deque[float] = deque(maxlen=self._basal_reward_window_steps)
 
         done = False
         step_count = 0
@@ -244,6 +255,8 @@ class Trainer:
             next_glucose = SimglucoseEnv.extract_glucose(next_obs)
             next_meal = self._extract_meal(next_info)
 
+            basal_bg_buffer.append(next_glucose)
+
             if next_meal > 0.0:
                 meal_window_steps_remaining = max(meal_window_steps_remaining, self._meal_window_steps)
                 recent_meal_grams = next_meal
@@ -255,7 +268,7 @@ class Trainer:
                 meal=next_meal,
             )
 
-            r_basal = basal_step_reward(next_glucose)
+            r_basal = basal_step_reward_from_buffer(tuple(basal_bg_buffer))
             r_bolus = bolus_step_reward(
                 next_glucose,
                 next_meal,
@@ -289,12 +302,15 @@ class Trainer:
                     done=done,
                 )
 
-                if decision.planner.intervened:
-                    planner_interventions += 1
-                if decision.planner.hard_safety_applied:
-                    planner_hard_safety_count += 1
-                if decision.planner.predicted_min_glucose < self.cfg.planner.low_glucose_threshold:
-                    planner_predicted_low_steps += 1
+            if decision is not None:
+                planner_active = decision.planner.mode not in ("bypass", "disabled")
+                if planner_active:
+                    if decision.planner.intervened:
+                        planner_interventions += 1
+                    if decision.planner.hard_safety_applied:
+                        planner_hard_safety_count += 1
+                    if decision.planner.predicted_min_glucose < self.cfg.planner.low_glucose_threshold:
+                        planner_predicted_low_steps += 1
 
             if train_basal:
                 for _ in range(self.cfg.sac_basal.updates_per_step):

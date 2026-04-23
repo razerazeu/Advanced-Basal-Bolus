@@ -7,6 +7,8 @@ from collections.abc import Sequence
 
 
 BOLUS_DELIVERY_MINUTES = 15.0
+BASAL_REWARD_WINDOW_HOURS = 7
+BASAL_REWARD_SCALE = 10.0
 
 
 def _range_indicator(bg: float, low: float, high: float) -> float:
@@ -24,48 +26,56 @@ def _nested_range_hit_count(bg: float) -> float:
 
 
 def basal_step_reward(bg: float) -> float:
-    """Basal nested-range reward with exponentiated range hit count."""
+    """Backward-compatible one-point basal reward proxy."""
 
-    nested_hits = _nested_range_hit_count(bg)
-    base_reward = math.exp(nested_hits)
+    return basal_step_reward_from_buffer([bg])
 
-    # Strongly discourage hypoglycemia so policy does not settle at low glucose.
-    if bg < 54.0:
-        hypo_penalty = 22.0 + 1.1 * (54.0 - bg)
-    elif bg < 70.0:
-        hypo_penalty = 8.0 + 0.5 * (70.0 - bg)
-    else:
-        hypo_penalty = 0.0
 
-    # Mild hyperglycemia penalty keeps control balanced around target range.
-    if bg > 250.0:
-        hyper_penalty = 2.5 + 0.04 * (bg - 250.0)
-    elif bg > 180.0:
-        hyper_penalty = 0.6 + 0.015 * (bg - 180.0)
-    else:
-        hyper_penalty = 0.0
+def basal_step_reward_from_buffer(bg_buffer: Sequence[float]) -> float:
+    """Algorithm-1 style basal reward from rolling BG buffer."""
 
-    return base_reward - hypo_penalty - hyper_penalty
+    n = max(len(bg_buffer), 1)
+
+    c_105_115 = sum(1 for g in bg_buffer if 105.0 < g < 115.0)
+    c_100_120 = sum(1 for g in bg_buffer if 100.0 < g < 120.0)
+    c_70_180 = sum(1 for g in bg_buffer if 70.0 < g < 180.0)
+
+    r_105_115 = BASAL_REWARD_SCALE * (c_105_115 / n)
+    r_100_120 = BASAL_REWARD_SCALE * (c_100_120 / n)
+    r_70_180 = BASAL_REWARD_SCALE * (c_70_180 / n)
+
+    return float(
+        math.exp(r_105_115 / 2.0)
+        + math.exp(r_100_120 / 2.0)
+        + math.exp(r_70_180 / 2.0)
+    )
 
 
 def basal_episode_reward(glucose_trace: Sequence[float]) -> float:
-    """Episode basal reward exactly as a sum of step-level terms."""
+    """Algorithm-1 episode reward as sum of per-step rolling-buffer rewards."""
 
-    return float(sum(basal_step_reward(g) for g in glucose_trace))
+    if len(glucose_trace) == 0:
+        return 0.0
+
+    # Simglucose main path runs at 5-minute steps, so 7h corresponds to 84 samples.
+    window_steps = int((BASAL_REWARD_WINDOW_HOURS * 60) / 5)
+    window_steps = max(window_steps, 1)
+
+    total_reward = 0.0
+    for idx in range(len(glucose_trace)):
+        start = max(0, idx - window_steps + 1)
+        bg_buffer = glucose_trace[start : idx + 1]
+        total_reward += basal_step_reward_from_buffer(bg_buffer)
+
+    return float(total_reward)
 
 
 def bolus_glucose_reward(bg: float) -> float:
-    """Glucose-dependent bolus reward from the spec."""
+    """Glucose-quality term using BGTarget=125 and [70, 180] control band."""
 
-    if bg < 54.0:
-        return -10.0 - (0.35 * (54.0 - bg))
-    if bg < 70.0:
-        return -5.0 - (0.15 * (70.0 - bg))
-    if bg <= 180.0:
-        return 1.2 * math.exp(-abs(bg - 125.0) / 45.0)
-    if bg <= 250.0:
-        return -0.03 * (bg - 180.0)
-    return -2.1 - 0.05 * (bg - 250.0)
+    if 70.0 <= bg <= 180.0:
+        return 0.1 * math.exp(-abs(bg - 125.0) / 100.0)
+    return -0.01 * abs(bg - 125.0)
 
 
 def bolus_action_reward(
@@ -75,23 +85,18 @@ def bolus_action_reward(
     meal_window_active: bool,
     recent_meal_grams: float,
 ) -> float:
-    """Meal-timing reward: reward on-window bolus, penalize mistimed bolus."""
+    """Action-timing term: +10 together, 0 if neither, -2 otherwise."""
 
-    bolus = bolus_units > 1e-4
+    del meal_window_active, recent_meal_grams
 
-    if meal_window_active and bolus:
-        meal_reference = max(meal_grams, recent_meal_grams)
-        target_bolus = max(0.0, meal_reference / 12.0) / max(BOLUS_DELIVERY_MINUTES, 1e-6)
-        dose_error = abs(bolus_units - target_bolus)
-        return max(-1.5, 1.6 - (0.35 * dose_error))
+    meal_occurs = meal_grams > 0.0
+    bolus_occurs = bolus_units > 1e-4
 
-    if meal_window_active and (not bolus):
-        return -1.8
-
-    if (not meal_window_active) and bolus:
-        return -2.6 - (0.5 * bolus_units)
-
-    return 0.1
+    if bolus_occurs and meal_occurs:
+        return 10.0
+    if (not bolus_occurs) and (not meal_occurs):
+        return 0.0
+    return -2.0
 
 
 def bolus_step_reward(
@@ -133,12 +138,8 @@ def risk_index(bg: float) -> float:
 
 
 def planner_risk_reward(next_bg: float) -> float:
-    """Risk-sensitive one-step planner reward."""
+    """G2P2C-inspired planner risk: fixed severe-low penalty else negative RI."""
 
-    if next_bg < 54.0:
-        return -220.0 - (2.0 * (54.0 - next_bg))
-    if next_bg < 70.0:
-        return -95.0 - (1.0 * (70.0 - next_bg))
-    if next_bg > 250.0:
-        return -30.0 - (0.2 * (next_bg - 250.0))
+    if next_bg <= 39.0:
+        return -15.0
     return -risk_index(next_bg)
