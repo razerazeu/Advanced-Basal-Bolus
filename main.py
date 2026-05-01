@@ -9,7 +9,7 @@ import torch
 from agents.sac_base import CentralizedCriticTrainer
 from agents.sac_basal import BasalSACAgent
 from agents.sac_bolus import BolusSACAgent
-from env.simglucose_wrapper import DAY_STEPS, STATE_DIM, SimglucoseEnvWrapper
+from env.simglucose_wrapper import DAY_STEPS, SimglucoseEnvWrapper
 from evaluation.evaluate import append_jsonl, compute_metrics, evaluate_episode, summarize_eval_entries
 from planner.planner import FrozenSafetyPlanner
 from training.rewards import basal_reward, bolus_reward
@@ -40,12 +40,12 @@ def run_combined_phase(
     if log_path.exists():
         log_path.unlink()
 
-    basal_agent = BasalSACAgent(state_dim=STATE_DIM, device=device)
+    basal_agent = BasalSACAgent(state_dim=36, device=device)
     basal_extra = basal_agent.load(basal_checkpoint_path)
     if isinstance(basal_extra, dict) and isinstance(basal_extra.get("normalizer"), dict):
         normalizer.load_state_dict(basal_extra["normalizer"])
 
-    bolus_agent = BolusSACAgent(state_dim=STATE_DIM, device=device)
+    bolus_agent = BolusSACAgent(state_dim=36, device=device)
     bolus_extra = bolus_agent.load(bolus_checkpoint_path)
     if isinstance(bolus_extra, dict) and isinstance(bolus_extra.get("normalizer"), dict):
         normalizer.load_state_dict(bolus_extra["normalizer"])
@@ -53,7 +53,7 @@ def run_combined_phase(
     basal_agent.unfreeze_actor()
 
     planner = FrozenSafetyPlanner(horizon=6)
-    centralized_critic = CentralizedCriticTrainer(state_dim=STATE_DIM, action_dim=2, device=device)
+    centralized_critic = CentralizedCriticTrainer(state_dim=36, action_dim=2, device=device)
 
     scenarios = ["A", "B", "C"]
     window_entries: list[dict] = []
@@ -71,7 +71,7 @@ def run_combined_phase(
         )
 
         state = env.reset()
-        cached_basal = env.clip_basal(env.u2ss)
+        cached_basal = float(np.clip(env.u2ss, 0.0, 0.05))
 
         glucose_trace: list[float] = []
         basal_trace: list[float] = []
@@ -83,10 +83,10 @@ def run_combined_phase(
         for step in range(DAY_STEPS):
             minute_of_day = (step * 5) % (24 * 60)
             if minute_of_day == 7 * 60:
-                cached_basal = env.clip_basal(basal_agent.select_action(state, deterministic=False))
+                cached_basal = float(np.clip(basal_agent.select_action(state, deterministic=False), 0.0, 0.05))
 
             if step % 3 == 0:
-                proposed_bolus = env.clip_bolus(bolus_agent.select_action(state, deterministic=False))
+                proposed_bolus = float(np.clip(bolus_agent.select_action(state, deterministic=False), 0.0, 0.5))
             else:
                 proposed_bolus = 0.0
 
@@ -100,13 +100,9 @@ def run_combined_phase(
                 proposed_bolus=proposed_bolus,
                 current_cgm=current_cgm,
                 meal_carbs=meal_carbs_now,
-                insulin_sensitivity_scale=env.insulin_sensitivity_scale,
-                cgm_trend=env.cgm_trend(),
             )
             if override:
                 planner_overrides += 1
-            final_basal = env.clip_basal(final_basal)
-            final_bolus = env.clip_bolus(final_bolus)
 
             next_state, done, info = env.step(final_basal, final_bolus)
 
@@ -129,8 +125,7 @@ def run_combined_phase(
                 if strict_checks:
                     assert bolus_losses["critic_loss"] != 0, "Bolus critic loss is zero — check reward signal"
 
-            centralized_reward = float(np.clip(0.5 * (r_basal + r_bolus), -20.0, 20.0))
-            centralized_critic.update(state, np.asarray([final_basal, final_bolus], dtype=np.float32), centralized_reward)
+            centralized_critic.update(state, np.asarray([final_basal, final_bolus], dtype=np.float32), 0.5 * (r_basal + r_bolus))
 
             glucose_trace.append(float(info["current_cgm"]))
             basal_trace.append(float(final_basal))
@@ -307,14 +302,14 @@ def main() -> None:
 
     if basal_agent is None:
         if basal_ckpt.exists():
-            basal_agent = BasalSACAgent(state_dim=STATE_DIM, device=args.device)
+            basal_agent = BasalSACAgent(state_dim=36, device=args.device)
             basal_extra = basal_agent.load(basal_ckpt)
             if isinstance(basal_extra, dict) and isinstance(basal_extra.get("normalizer"), dict):
                 normalizer.load_state_dict(basal_extra["normalizer"])
 
     if bolus_agent is None:
         if bolus_ckpt.exists():
-            bolus_agent = BolusSACAgent(state_dim=STATE_DIM, device=args.device)
+            bolus_agent = BolusSACAgent(state_dim=36, device=args.device)
             bolus_extra = bolus_agent.load(bolus_ckpt)
             if isinstance(bolus_extra, dict) and isinstance(bolus_extra.get("normalizer"), dict):
                 normalizer.load_state_dict(bolus_extra["normalizer"])
@@ -332,7 +327,6 @@ def main() -> None:
         scenario_name=eval_scenario,
         seed=args.seed + 3000,
     )
-
 
 if __name__ == "__main__":
     main()
